@@ -105,22 +105,142 @@ jobs:
             fi
           fi
           
+      # 提交并推送本次生成的日报
       - name: Commit and push changes
+        id: commit
+        shell: bash
         run: |
+          set -euo pipefail
+
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          
-          git add today/ daily/
+
+          # 添加日报及归档目录
+          if [ -d "today" ]; then
+            git add today/
+          fi
+
+          if [ -d "daily" ]; then
+            git add daily/
+          fi
+
+          # RSS 文件存在时一并提交
           if [ -f "rss.xml" ]; then
             git add rss.xml
           else
-            echo "rss.xml 未找到，不添加到提交中。"
+            echo "rss.xml 不存在，本次不提交 rss.xml"
           fi
 
+          # 没有文件变化时，不提交，也不发送企业微信
           if git diff --staged --quiet; then
-            echo "没有文件变更，无需提交。"
-          else
-            echo "检测到文件变更，正在提交..."
-            git commit -m "docs: 自动构建日刊并归档旧月份 (`date -u`)"
-            git push
+            echo "没有检测到文件变化，无需提交。"
+
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "commit_sha=" >> "$GITHUB_OUTPUT"
+            echo "commit_url=" >> "$GITHUB_OUTPUT"
+
+            exit 0
           fi
+
+          TODAY_DATE=$(TZ="Asia/Shanghai" date +%Y-%m-%d)
+
+          git commit -m "docs: 自动生成 AI 日报 ${TODAY_DATE}"
+          git push
+
+          COMMIT_SHA=$(git rev-parse HEAD)
+          COMMIT_URL="https://github.com/${GITHUB_REPOSITORY}/commit/${COMMIT_SHA}"
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=${COMMIT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "commit_url=${COMMIT_URL}" >> "$GITHUB_OUTPUT"
+
+          echo "日报提交成功：${COMMIT_SHA}"
+
+      # 仅在日报发生变化并成功推送后，发送企业微信群机器人消息
+      - name: Send daily report to WeCom
+        if: steps.commit.outputs.changed == 'true'
+        shell: bash
+        env:
+          # 必填：在 GitHub Actions Secrets 中配置
+          WECOM_WEBHOOK_URL: ${{ secrets.WECOM_WEBHOOK_URL }}
+
+          # 选填：在 GitHub Actions Variables 中配置日报网站地址
+          # 例如：https://your-domain.com/
+          # 未配置时，自动使用本次 GitHub Commit 地址
+          REPORT_BASE_URL: ${{ vars.REPORT_BASE_URL }}
+
+          COMMIT_URL: ${{ steps.commit.outputs.commit_url }}
+          COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${WECOM_WEBHOOK_URL:-}" ]; then
+            echo "::error::未配置 GitHub Actions Secret：WECOM_WEBHOOK_URL"
+            exit 1
+          fi
+
+          TODAY_DATE=$(TZ="Asia/Shanghai" date +%Y-%m-%d)
+
+          # 优先使用日报网站地址；没有配置时，使用 GitHub Commit 地址
+          if [ -n "${REPORT_BASE_URL:-}" ]; then
+            REPORT_URL="${REPORT_BASE_URL}"
+          else
+            REPORT_URL="${COMMIT_URL}"
+          fi
+
+          # 截取短 Commit SHA
+          SHORT_SHA="${COMMIT_SHA:0:7}"
+
+          MARKDOWN_CONTENT=$(cat <<EOF
+          ## AI 资讯日报｜${TODAY_DATE}
+
+          今日 AI 资讯日报已自动生成并发布。
+
+          > 内容包括 AI 行业动态、热门开源项目、前沿论文及相关资讯。
+
+          [点击查看完整日报](${REPORT_URL})
+
+          提交版本：\`${SHORT_SHA}\`
+          EOF
+          )
+
+          # 使用 jq 生成 JSON，避免换行、双引号等字符破坏请求格式
+          PAYLOAD=$(jq -n \
+            --arg content "$MARKDOWN_CONTENT" \
+            '{
+              msgtype: "markdown",
+              markdown: {
+                content: $content
+              }
+            }')
+
+          echo "正在发送企业微信消息……"
+
+          RESPONSE=$(curl \
+            --fail \
+            --silent \
+            --show-error \
+            --retry 3 \
+            --retry-delay 5 \
+            --retry-connrefused \
+            --connect-timeout 15 \
+            --max-time 30 \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "$WECOM_WEBHOOK_URL")
+
+          echo "企业微信返回：${RESPONSE}"
+
+          # 企业微信即使业务失败，也可能返回 HTTP 200，因此必须检查 errcode
+          if ! ERR_CODE=$(echo "$RESPONSE" | jq -er '.errcode'); then
+            echo "::error::企业微信返回内容不是有效的 JSON，或缺少 errcode"
+            exit 1
+          fi
+
+          if [ "$ERR_CODE" != "0" ]; then
+            ERR_MSG=$(echo "$RESPONSE" | jq -r '.errmsg // "未知错误"')
+            echo "::error::企业微信消息发送失败，errcode=${ERR_CODE}，errmsg=${ERR_MSG}"
+            exit 1
+          fi
+
+          echo "企业微信消息发送成功。"
