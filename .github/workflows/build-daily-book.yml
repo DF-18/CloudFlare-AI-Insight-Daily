@@ -19,10 +19,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
-          # 明确指定要检出的分支
-          ref: 'book' # <-- 请将 'book' 替换为你的目标分支名
+          ref: main
+          fetch-depth: 0
 
       - name: Archive old notes
         id: archive
