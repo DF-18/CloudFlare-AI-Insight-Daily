@@ -163,7 +163,7 @@ jobs:
         shell: bash
         env:
           # 必填：在 GitHub Actions Secrets 中配置
-          WECOM_WEBHOOK_URL: ${{ secrets.WECOM_WEBHOOK_URL }}
+          WECOM_WEBHOOK_URL: ${{ secrets.WECOM_WEBHOOK_URL_RISK_TEST }}
 
           # 选填：在 GitHub Actions Variables 中配置日报网站地址
           # 未配置时，有新提交则使用 Commit 地址；无新提交则使用仓库首页
@@ -176,7 +176,7 @@ jobs:
           set -euo pipefail
 
           if [ -z "${WECOM_WEBHOOK_URL:-}" ]; then
-            echo "::error::未配置 GitHub Actions Secret：WECOM_WEBHOOK_URL"
+            echo "::error::未配置 GitHub Actions Secret：WECOM_WEBHOOK_URL_RISK_TEST"
             exit 1
           fi
 
