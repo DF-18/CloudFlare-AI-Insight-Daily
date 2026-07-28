@@ -132,7 +132,7 @@ jobs:
             echo "rss.xml 不存在，本次不提交 rss.xml"
           fi
 
-          # 没有文件变化时，不提交，也不发送企业微信
+          # 没有文件变化时不提交，但仍允许后续发送企业微信通知
           if git diff --staged --quiet; then
             echo "没有检测到文件变化，无需提交。"
 
@@ -157,21 +157,21 @@ jobs:
 
           echo "日报提交成功：${COMMIT_SHA}"
 
-      # 仅在日报发生变化并成功推送后，发送企业微信群机器人消息
+      # 无论是否有文件变化，只要前序步骤成功，均发送企业微信群机器人消息
       - name: Send daily report to WeCom
-        if: steps.commit.outputs.changed == 'true'
+        if: success()
         shell: bash
         env:
           # 必填：在 GitHub Actions Secrets 中配置
           WECOM_WEBHOOK_URL: ${{ secrets.WECOM_WEBHOOK_URL }}
 
           # 选填：在 GitHub Actions Variables 中配置日报网站地址
-          # 例如：https://your-domain.com/
-          # 未配置时，自动使用本次 GitHub Commit 地址
+          # 未配置时，有新提交则使用 Commit 地址；无新提交则使用仓库首页
           REPORT_BASE_URL: ${{ vars.REPORT_BASE_URL }}
 
           COMMIT_URL: ${{ steps.commit.outputs.commit_url }}
           COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
+          CONTENT_CHANGED: ${{ steps.commit.outputs.changed }}
         run: |
           set -euo pipefail
 
@@ -182,26 +182,35 @@ jobs:
 
           TODAY_DATE=$(TZ="Asia/Shanghai" date +%Y-%m-%d)
 
-          # 优先使用日报网站地址；没有配置时，使用 GitHub Commit 地址
+          # 确定日报链接
           if [ -n "${REPORT_BASE_URL:-}" ]; then
             REPORT_URL="${REPORT_BASE_URL}"
-          else
+          elif [ -n "${COMMIT_URL:-}" ]; then
             REPORT_URL="${COMMIT_URL}"
+          else
+            REPORT_URL="https://github.com/${GITHUB_REPOSITORY}"
           fi
 
-          # 截取短 Commit SHA
-          SHORT_SHA="${COMMIT_SHA:0:7}"
+          # 根据本次是否生成新提交设置不同提示
+          if [ "${CONTENT_CHANGED:-false}" = "true" ]; then
+            STATUS_TEXT="今日 AI 资讯日报已生成并发布。"
+            SHORT_SHA="${COMMIT_SHA:0:7}"
+            VERSION_TEXT="提交版本：\`${SHORT_SHA}\`"
+          else
+            STATUS_TEXT="今日 AI 日报任务已执行，但未检测到新的文件变化。"
+            VERSION_TEXT="本次未产生新的 Git 提交。"
+          fi
 
           MARKDOWN_CONTENT=$(cat <<EOF
           ## AI 资讯日报｜${TODAY_DATE}
 
-          今日 AI 资讯日报已自动生成并发布。
+          ${STATUS_TEXT}
 
           > 内容包括 AI 行业动态、热门开源项目、前沿论文及相关资讯。
 
-          [点击查看完整日报](${REPORT_URL})
+          [点击查看日报](${REPORT_URL})
 
-          提交版本：\`${SHORT_SHA}\`
+          ${VERSION_TEXT}
           EOF
           )
 
