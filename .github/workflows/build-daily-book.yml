@@ -165,8 +165,7 @@ jobs:
           # 必填：在 GitHub Actions Secrets 中配置
           WECOM_WEBHOOK_URL: ${{ secrets.WECOM_WEBHOOK_URL_RISK_TEST }}
 
-          # 选填：在 GitHub Actions Variables 中配置日报网站地址
-          # 未配置时，有新提交则使用 Commit 地址；无新提交则使用仓库首页
+          # 可选：未找到日报文件时使用的备用地址
           REPORT_BASE_URL: ${{ vars.REPORT_BASE_URL }}
 
           COMMIT_URL: ${{ steps.commit.outputs.commit_url }}
@@ -182,13 +181,25 @@ jobs:
 
           TODAY_DATE=$(TZ="Asia/Shanghai" date +%Y-%m-%d)
 
-          # 确定日报链接
-          if [ -n "${REPORT_BASE_URL:-}" ]; then
+          # 按文件名日期查找 daily 目录中的最新日报，兼容月份归档子目录
+          LATEST_DAILY_FILE=$(find daily -type f -name '20??-??-??.md' -printf '%f\t%p\n' \
+            | sort -r \
+            | head -n 1 \
+            | cut -f2-)
+
+          if [ -n "${LATEST_DAILY_FILE:-}" ]; then
+            REPORT_PATH="${LATEST_DAILY_FILE#./}"
+            REPORT_URL="https://github.com/${GITHUB_REPOSITORY}/blob/main/${REPORT_PATH}"
+            LATEST_REPORT_DATE=$(basename "$LATEST_DAILY_FILE" .md)
+          elif [ -n "${REPORT_BASE_URL:-}" ]; then
             REPORT_URL="${REPORT_BASE_URL}"
+            LATEST_REPORT_DATE="${TODAY_DATE}"
           elif [ -n "${COMMIT_URL:-}" ]; then
             REPORT_URL="${COMMIT_URL}"
+            LATEST_REPORT_DATE="${TODAY_DATE}"
           else
             REPORT_URL="https://github.com/${GITHUB_REPOSITORY}"
+            LATEST_REPORT_DATE="${TODAY_DATE}"
           fi
 
           # 根据本次是否生成新提交设置不同提示
@@ -197,8 +208,8 @@ jobs:
             SHORT_SHA="${COMMIT_SHA:0:7}"
             VERSION_TEXT="提交版本：\`${SHORT_SHA}\`"
           else
-            STATUS_TEXT="今日 AI 日报任务已执行，但未检测到新的文件变化。"
-            VERSION_TEXT="本次未产生新的 Git 提交。"
+            STATUS_TEXT="日报任务已执行，以下为当前最新日报。"
+            VERSION_TEXT="最新日报日期：${LATEST_REPORT_DATE}"
           fi
 
           MARKDOWN_CONTENT=$(cat <<EOF
@@ -208,7 +219,7 @@ jobs:
 
           > 内容包括 AI 行业动态、热门开源项目、前沿论文及相关资讯。
 
-          [点击查看日报](${REPORT_URL})
+          [点击查看最新日报](${REPORT_URL})
 
           ${VERSION_TEXT}
           EOF
@@ -225,6 +236,7 @@ jobs:
             }')
 
           echo "正在发送企业微信消息……"
+          echo "最新日报链接：${REPORT_URL}"
 
           RESPONSE=$(curl \
             --fail \
