@@ -5,14 +5,14 @@ on:
     # 每天北京时间 07:10 触发
     - cron: '10 7 * * *'
       timezone: 'Asia/Shanghai'
-    
+
   # 手动触发
   workflow_dispatch:
-  
+
 jobs:
   build-book:
     runs-on: ubuntu-latest
-      
+
     # 需要写入权限来提交生成的文件和归档的日刊
     permissions:
       contents: write
@@ -28,23 +28,29 @@ jobs:
         id: archive
         run: |
           echo "开始检查并归档旧的日刊..."
-          # 查找最新文件以确定当前月份
-          LATEST_DAILY_FILE=$(find daily -type f -name "*.md" | sort -r | head -n 1)
-          if [ -z "$LATEST_DAILY_FILE" ]; then
-            echo "在 'daily' 目录中没有找到任何 .md 文件，跳过归档步骤。"
+
+          # 当前 fork 的 main 分支可能没有 daily 目录
+          if [ ! -d "daily" ]; then
+            echo "仓库中不存在 daily 目录，跳过归档步骤。"
             exit 0
           fi
-          
+
+          # 查找最新文件以确定当前月份
+          LATEST_DAILY_FILE=$(find daily -type f -name "*.md" | sort -r | head -n 1 || true)
+          if [ -z "$LATEST_DAILY_FILE" ]; then
+            echo "在 daily 目录中没有找到任何 .md 文件，跳过归档步骤。"
+            exit 0
+          fi
+
           LATEST_MONTH=$(basename "$LATEST_DAILY_FILE" .md | cut -d'-' -f1,2)
           echo "当前最新月份是: $LATEST_MONTH"
 
           # 仅遍历 daily/ 根目录下的 md 文件进行归档
           for file in daily/*.md; do
-            # 如果根目录下没有md文件，循环会匹配到 "daily/*.md" 字符串，需要跳过
             [ -e "$file" ] || continue
-            
+
             FILE_MONTH=$(basename "$file" .md | cut -d'-' -f1,2)
-            
+
             if [ "$FILE_MONTH" != "$LATEST_MONTH" ]; then
               TARGET_DIR="daily/$FILE_MONTH"
               mkdir -p "$TARGET_DIR"
@@ -56,43 +62,34 @@ jobs:
 
       - name: Trigger RSS Data Write (2 attempts, 3 retries each)
         run: |
-          # 检查 `WRITE_RSS_URL` 变量是否已设置
+          # 检查 WRITE_RSS_URL 变量是否已设置
           if [ -z "${{ vars.WRITE_RSS_URL }}" ]; then
             echo "警告: WRITE_RSS_URL 仓库变量未设置或为空，跳过此步骤。"
             exit 0
           fi
 
-          # 设置时区为 Asia/Shanghai (东八区)，并获取 YYYY-MM-DD 格式的日期
           TODAY_DATE=$(TZ="Asia/Shanghai" date +%Y-%m-%d)
           FULL_URL="${{ vars.WRITE_RSS_URL }}?date=$TODAY_DATE"
-          
+
           echo "将向以下 URL 发送2次请求（每次请求若失败则重试3次）:"
           echo "$FULL_URL"
-          
-          # 循环两次，发送两次独立的请求
+
           for i in 1 2
           do
             echo "---"
             echo "正在发送第 $i 次请求..."
-            
-            # 使用 curl 发起请求，并配置重试逻辑
-            # -f: 在遇到服务器HTTP错误时，以错误码退出（对CI/CD很重要）
-            # -sS: 静默模式，但仍然显示错误信息
-            # --retry 3: 如果命令失败，则最多重试3次
-            # --retry-delay 5: 每次重试之间等待5秒
-            # --retry-connrefused: 在“连接被拒绝”时也进行重试，增强网络抖动的鲁棒性
+
             if curl -fsS --retry 3 --retry-delay 5 --retry-connrefused "$FULL_URL"; then
               echo "第 $i 次请求成功。"
             else
               echo "错误：第 $i 次请求在3次重试后仍然失败。"
-              # 使整个步骤失败
               exit 1
             fi
           done
-          
+
           echo "---"
           echo "两次请求均已成功发送。"
-          
+
       - name: Download RSS Feed
         run: |
           if [ -z "${{ vars.RSS_FEED_URL }}" ]; then
@@ -105,7 +102,7 @@ jobs:
               echo "错误: 下载 RSS Feed 失败。wget 返回错误码 $?。"
             fi
           fi
-          
+
       # 提交并推送本次生成的日报
       - name: Commit and push changes
         id: commit
@@ -116,7 +113,6 @@ jobs:
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
 
-          # 添加日报及归档目录
           if [ -d "today" ]; then
             git add today/
           fi
@@ -125,7 +121,6 @@ jobs:
             git add daily/
           fi
 
-          # RSS 文件存在时一并提交
           if [ -f "rss.xml" ]; then
             git add rss.xml
           else
@@ -162,13 +157,11 @@ jobs:
         if: success()
         shell: bash
         env:
-          # 必填：在 GitHub Actions Secrets 中配置
           WECOM_WEBHOOK_URL: ${{ secrets.WECOM_WEBHOOK_URL_RISK_TEST }}
 
-          # 可选：未找到日报文件时使用的备用地址
+          # 可选：可以将该变量设置为其他日报列表页
           REPORT_BASE_URL: ${{ vars.REPORT_BASE_URL }}
 
-          COMMIT_URL: ${{ steps.commit.outputs.commit_url }}
           COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
           CONTENT_CHANGED: ${{ steps.commit.outputs.changed }}
         run: |
@@ -180,33 +173,44 @@ jobs:
           fi
 
           TODAY_DATE=$(TZ="Asia/Shanghai" date +%Y-%m-%d)
+          DOCS_INDEX_URL="${REPORT_BASE_URL:-https://hex2077.dev/docs/}"
 
-          # 按文件名日期查找 daily 目录中的最新日报，兼容月份归档子目录
-          LATEST_DAILY_FILE=$(find daily -type f -name '20??-??-??.md' -printf '%f\t%p\n' \
+          # 从官方日报列表页解析所有日期型日报链接，并按日期倒序取第一条
+          # 解析失败时保留空值，后面回退到日报列表页，不中断任务
+          INDEX_HTML=$(curl -fsSL \
+            --retry 3 \
+            --retry-delay 3 \
+            --retry-connrefused \
+            --connect-timeout 15 \
+            --max-time 45 \
+            "$DOCS_INDEX_URL" || true)
+
+          LATEST_REPORT_LINK=$(printf '%s' "$INDEX_HTML" \
+            | grep -oE '(https?://[^"[:space:]]+)?/docs/[0-9]{4}-[0-9]{2}/[0-9]{4}-[0-9]{2}-[0-9]{2}/' \
+            | sed 's/&amp;/\&/g' \
             | sort -r \
-            | head -n 1 \
-            | cut -f2-)
+            | head -n 1 || true)
 
-          if [ -n "${LATEST_DAILY_FILE:-}" ]; then
-            REPORT_PATH="${LATEST_DAILY_FILE#./}"
-            REPORT_URL="https://github.com/${GITHUB_REPOSITORY}/blob/main/${REPORT_PATH}"
-            LATEST_REPORT_DATE=$(basename "$LATEST_DAILY_FILE" .md)
-          elif [ -n "${REPORT_BASE_URL:-}" ]; then
-            REPORT_URL="${REPORT_BASE_URL}"
-            LATEST_REPORT_DATE="${TODAY_DATE}"
-          elif [ -n "${COMMIT_URL:-}" ]; then
-            REPORT_URL="${COMMIT_URL}"
-            LATEST_REPORT_DATE="${TODAY_DATE}"
+          if [ -n "${LATEST_REPORT_LINK:-}" ]; then
+            if [[ "$LATEST_REPORT_LINK" =~ ^https?:// ]]; then
+              REPORT_URL="$LATEST_REPORT_LINK"
+            else
+              BASE_ORIGIN=$(printf '%s' "$DOCS_INDEX_URL" | sed -E 's#(https?://[^/]+).*#\1#')
+              REPORT_URL="${BASE_ORIGIN}${LATEST_REPORT_LINK}"
+            fi
+
+            LATEST_REPORT_DATE=$(basename "${LATEST_REPORT_LINK%/}")
+            echo "已解析到最新日报：${LATEST_REPORT_DATE}"
           else
-            REPORT_URL="https://github.com/${GITHUB_REPOSITORY}"
-            LATEST_REPORT_DATE="${TODAY_DATE}"
+            REPORT_URL="$DOCS_INDEX_URL"
+            LATEST_REPORT_DATE="未识别"
+            echo "警告：未能解析最新日报链接，回退到日报列表页。"
           fi
 
-          # 根据本次是否生成新提交设置不同提示
           if [ "${CONTENT_CHANGED:-false}" = "true" ]; then
-            STATUS_TEXT="今日 AI 资讯日报已生成并发布。"
+            STATUS_TEXT="今日 AI 资讯日报任务已完成。"
             SHORT_SHA="${COMMIT_SHA:0:7}"
-            VERSION_TEXT="提交版本：\`${SHORT_SHA}\`"
+            VERSION_TEXT="工作流提交版本：\`${SHORT_SHA}\`"
           else
             STATUS_TEXT="日报任务已执行，以下为当前最新日报。"
             VERSION_TEXT="最新日报日期：${LATEST_REPORT_DATE}"
@@ -225,7 +229,6 @@ jobs:
           EOF
           )
 
-          # 使用 jq 生成 JSON，避免换行、双引号等字符破坏请求格式
           PAYLOAD=$(jq -n \
             --arg content "$MARKDOWN_CONTENT" \
             '{
@@ -253,7 +256,6 @@ jobs:
 
           echo "企业微信返回：${RESPONSE}"
 
-          # 企业微信即使业务失败，也可能返回 HTTP 200，因此必须检查 errcode
           if ! ERR_CODE=$(echo "$RESPONSE" | jq -er '.errcode'); then
             echo "::error::企业微信返回内容不是有效的 JSON，或缺少 errcode"
             exit 1
