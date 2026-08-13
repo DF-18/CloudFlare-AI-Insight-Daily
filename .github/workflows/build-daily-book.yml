@@ -1,69 +1,88 @@
-name: Send Latest AI Daily to WeCom
+name: Send Today's AI Daily to WeCom
 
 on:
   schedule:
-    # 每天北京时间 07:10 获取 hex2077.dev 的最新日报并发送企业微信
-    - cron: '10 7 * * *'
+    # 北京时间 08:10-12:10 每小时检查一次；当天日报一旦成功发送，后续检查自动跳过
+    - cron: '10 8-12 * * *'
       timezone: 'Asia/Shanghai'
   workflow_dispatch:
 
+concurrency:
+  group: send-hex2077-daily
+  cancel-in-progress: false
+
 jobs:
-  send-latest-daily:
+  send-today-daily:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
-      - name: Resolve latest report from hex2077.dev
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Resolve today's report
         id: report
         shell: bash
         run: |
           set -euo pipefail
 
-          BASE_URL="https://hex2077.dev"
-          INDEX_URL="${BASE_URL}/docs/"
+          TODAY_DATE=$(TZ="Asia/Shanghai" date +%Y-%m-%d)
+          YEAR_MONTH=$(TZ="Asia/Shanghai" date +%Y-%m)
+          REPORT_URL="https://hex2077.dev/docs/${YEAR_MONTH}/${TODAY_DATE}/"
+          STATE_FILE=".github/state/last_sent_daily.txt"
 
-          echo "正在读取日报中心：${INDEX_URL}"
+          echo "北京时间日期：${TODAY_DATE}"
+          echo "检查当天日报：${REPORT_URL}"
 
-          INDEX_HTML=$(curl -fsSL \
-            --retry 3 \
-            --retry-delay 5 \
-            --retry-connrefused \
-            --connect-timeout 15 \
-            --max-time 60 \
-            -A "Mozilla/5.0 GitHub-Actions-AI-Daily-Bot" \
-            "$INDEX_URL")
-
-          # 提取形如 /docs/2026-08/2026-08-02/ 的日报链接，按日期倒序取最新一期
-          LATEST_PATH=$(printf '%s' "$INDEX_HTML" \
-            | grep -oE '/docs/[0-9]{4}-[0-9]{2}/[0-9]{4}-[0-9]{2}-[0-9]{2}/' \
-            | sort -u -r \
-            | head -n 1 || true)
-
-          if [ -z "${LATEST_PATH:-}" ]; then
-            echo "::error::未能从 ${INDEX_URL} 解析出最新日报链接"
-            exit 1
+          # 定时任务：如果今天已经成功推送过，则直接结束，避免重复消息。
+          # 手动触发 workflow_dispatch 时允许再次发送，方便测试。
+          LAST_SENT=""
+          if [ -f "$STATE_FILE" ]; then
+            LAST_SENT=$(tr -d '\r\n ' < "$STATE_FILE")
           fi
 
-          REPORT_DATE=$(basename "${LATEST_PATH%/}")
-          REPORT_URL="${BASE_URL}${LATEST_PATH}"
+          if [ "${GITHUB_EVENT_NAME}" = "schedule" ] && [ "$LAST_SENT" = "$TODAY_DATE" ]; then
+            echo "${TODAY_DATE} 日报今天已经发送过，跳过本次检查。"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "already_sent=true" >> "$GITHUB_OUTPUT"
+            echo "date=${TODAY_DATE}" >> "$GITHUB_OUTPUT"
+            echo "url=${REPORT_URL}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
-          # 验证日报页面可访问
-          curl -fsSL \
-            --retry 3 \
-            --retry-delay 5 \
-            --retry-connrefused \
+          # 不依赖 /docs/ 首页索引，直接验证当天固定 URL。
+          # 页面尚未发布时，本次任务正常结束，等待下一个定时时点再次检查。
+          HTTP_CODE=$(curl \
+            --silent \
+            --show-error \
+            --location \
+            --output /tmp/today-report.html \
+            --write-out '%{http_code}' \
             --connect-timeout 15 \
             --max-time 60 \
             -A "Mozilla/5.0 GitHub-Actions-AI-Daily-Bot" \
-            -o /dev/null \
-            "$REPORT_URL"
+            "$REPORT_URL" || true)
 
-          echo "date=${REPORT_DATE}" >> "$GITHUB_OUTPUT"
+          # 除了 HTTP 200，还校验页面正文中确实出现当天日报标题，避免自定义 404 页面误判。
+          if [ "$HTTP_CODE" = "200" ] && grep -q "AI资讯日报 ${TODAY_DATE}" /tmp/today-report.html; then
+            echo "检测到当天日报：${TODAY_DATE}"
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "当天日报尚未发布或页面尚未就绪（HTTP ${HTTP_CODE}），本次不发送企业微信。"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "already_sent=false" >> "$GITHUB_OUTPUT"
+          echo "date=${TODAY_DATE}" >> "$GITHUB_OUTPUT"
           echo "url=${REPORT_URL}" >> "$GITHUB_OUTPUT"
 
-          echo "最新日报日期：${REPORT_DATE}"
-          echo "最新日报链接：${REPORT_URL}"
-
-      - name: Send latest report to WeCom
+      - name: Send today's report to WeCom
+        id: wecom
+        if: steps.report.outputs.available == 'true'
         shell: bash
         env:
           WECOM_WEBHOOK_URL: ${{ secrets.WECOM_WEBHOOK_URL_RISK_TEST }}
@@ -80,17 +99,15 @@ jobs:
           MARKDOWN_CONTENT=$(cat <<EOF
           ## AI 资讯日报｜${REPORT_DATE}
 
-          hex2077.dev 已发布最新一期 AI 资讯日报。
+          hex2077.dev 今日 AI 资讯日报已发布。
 
-          [点击查看最新日报](${REPORT_URL})
+          [点击查看今日日报](${REPORT_URL})
           EOF
           )
 
           PAYLOAD=$(jq -n \
             --arg content "$MARKDOWN_CONTENT" \
             '{msgtype:"markdown",markdown:{content:$content}}')
-
-          echo "正在发送企业微信消息……"
 
           RESPONSE=$(curl \
             --fail \
@@ -115,4 +132,29 @@ jobs:
             exit 1
           fi
 
-          echo "企业微信消息发送成功。"
+          echo "企业微信消息发送成功：${REPORT_DATE}"
+
+      - name: Mark today's report as sent
+        if: steps.report.outputs.available == 'true' && steps.wecom.conclusion == 'success' && github.event_name == 'schedule'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TODAY_DATE="${{ steps.report.outputs.date }}"
+          STATE_FILE=".github/state/last_sent_daily.txt"
+
+          mkdir -p "$(dirname "$STATE_FILE")"
+          printf '%s\n' "$TODAY_DATE" > "$STATE_FILE"
+
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add "$STATE_FILE"
+
+          if git diff --staged --quiet; then
+            echo "发送状态无需更新。"
+            exit 0
+          fi
+
+          git commit -m "chore: mark AI daily sent ${TODAY_DATE}"
+          git push origin HEAD:main
+          echo "已记录 ${TODAY_DATE} 日报发送状态。"
