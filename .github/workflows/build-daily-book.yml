@@ -2,8 +2,8 @@ name: Send Today's AI Daily to WeCom
 
 on:
   schedule:
-    # 北京时间 08:10-12:10 每小时检查一次；当天日报一旦成功发送，后续检查自动跳过
-    - cron: '10 8-12 * * *'
+    # 北京时间 08:10-18:10 每小时检查一次；当天日报一旦成功发送，后续检查自动跳过
+    - cron: '10 8-18 * * *'
       timezone: 'Asia/Shanghai'
   workflow_dispatch:
 
@@ -32,19 +32,20 @@ jobs:
 
           TODAY_DATE=$(TZ="Asia/Shanghai" date +%Y-%m-%d)
           YEAR_MONTH=$(TZ="Asia/Shanghai" date +%Y-%m)
+          DATE_SLASH_FULL=$(TZ="Asia/Shanghai" date +%Y/%m/%d)
+          DATE_SLASH_SHORT=$(TZ="Asia/Shanghai" date +%-Y/%-m/%-d)
           REPORT_URL="https://hex2077.dev/docs/${YEAR_MONTH}/${TODAY_DATE}/"
           STATE_FILE=".github/state/last_sent_daily.txt"
 
           echo "北京时间日期：${TODAY_DATE}"
           echo "检查当天日报：${REPORT_URL}"
 
-          # 定时任务：如果今天已经成功推送过，则直接结束，避免重复消息。
-          # 手动触发 workflow_dispatch 时允许再次发送，方便测试。
           LAST_SENT=""
           if [ -f "$STATE_FILE" ]; then
             LAST_SENT=$(tr -d '\r\n ' < "$STATE_FILE")
           fi
 
+          # 定时任务中，同一天成功发送过后不再重复发送；手动触发仍允许再次测试。
           if [ "${GITHUB_EVENT_NAME}" = "schedule" ] && [ "$LAST_SENT" = "$TODAY_DATE" ]; then
             echo "${TODAY_DATE} 日报今天已经发送过，跳过本次检查。"
             echo "available=false" >> "$GITHUB_OUTPUT"
@@ -54,8 +55,6 @@ jobs:
             exit 0
           fi
 
-          # 不依赖 /docs/ 首页索引，直接验证当天固定 URL。
-          # 页面尚未发布时，本次任务正常结束，等待下一个定时时点再次检查。
           HTTP_CODE=$(curl \
             --silent \
             --show-error \
@@ -67,12 +66,32 @@ jobs:
             -A "Mozilla/5.0 GitHub-Actions-AI-Daily-Bot" \
             "$REPORT_URL" || true)
 
-          # 除了 HTTP 200，还校验页面正文中确实出现当天日报标题，避免自定义 404 页面误判。
-          if [ "$HTTP_CODE" = "200" ] && grep -q "AI资讯日报 ${TODAY_DATE}" /tmp/today-report.html; then
+          PAGE_TITLE=$(grep -oiE '<title[^>]*>[^<]*</title>' /tmp/today-report.html 2>/dev/null \
+            | head -n 1 \
+            | sed -E 's/<[^>]+>//g' || true)
+
+          echo "HTTP 状态：${HTTP_CODE}"
+          echo "页面标题：${PAGE_TITLE:-未读取到}"
+
+          IS_NOT_FOUND=false
+          if printf '%s' "$PAGE_TITLE" | grep -Eiq '(^|[^0-9])404([^0-9]|$)|not found|page not found|页面不存在|找不到页面'; then
+            IS_NOT_FOUND=true
+          fi
+
+          HAS_REPORT_MARKER=false
+          if grep -Fq "$REPORT_URL" /tmp/today-report.html 2>/dev/null \
+            || grep -Fq "$TODAY_DATE" /tmp/today-report.html 2>/dev/null \
+            || grep -Fq "$DATE_SLASH_FULL" /tmp/today-report.html 2>/dev/null \
+            || grep -Fq "$DATE_SLASH_SHORT" /tmp/today-report.html 2>/dev/null; then
+            HAS_REPORT_MARKER=true
+          fi
+
+          # 页面为 200、不是明确的 404 页面，且正文/元数据中能识别到当天 URL 或当天日期，即判定为已发布。
+          if [ "$HTTP_CODE" = "200" ] && [ "$IS_NOT_FOUND" = "false" ] && [ "$HAS_REPORT_MARKER" = "true" ]; then
             echo "检测到当天日报：${TODAY_DATE}"
             echo "available=true" >> "$GITHUB_OUTPUT"
           else
-            echo "当天日报尚未发布或页面尚未就绪（HTTP ${HTTP_CODE}），本次不发送企业微信。"
+            echo "当天日报尚未确认发布，本次不发送企业微信。"
             echo "available=false" >> "$GITHUB_OUTPUT"
           fi
 
